@@ -13,3 +13,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+# Secrets and IDE files
+.env
+.idea/
+.vscode/

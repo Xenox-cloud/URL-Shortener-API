@@ -1,64 +1,52 @@
-from fastapi import APIRouter, HTTPException
+import psycopg2
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, HttpUrl
 from .db import cursor
 from .utils import generate_code
 from .logger import logger
 
 router = APIRouter()
 
+MAX_CODE_ATTEMPTS = 5
+
+
+class ShortenRequest(BaseModel):
+    url: HttpUrl
+
+
 # 🔹 Create short URL
-@router.post("/shorten")
-def shorten(url: str):
+@router.post("/shorten", status_code=201)
+def shorten(body: ShortenRequest, request: Request):
+    url = str(body.url)
 
-    if not url.startswith("http"):
-        raise HTTPException(status_code=400, detail="Invalid URL")
-
-    # ensure unique code
-    while True:
+    # The unique index on short_code rejects collisions, so retry with a new code
+    for _ in range(MAX_CODE_ATTEMPTS):
         code = generate_code()
-        cursor.execute("SELECT 1 FROM urls WHERE short_code=%s", (code,))
-        if not cursor.fetchone():
+        try:
+            cursor.execute(
+                "INSERT INTO urls (original_url, short_code) VALUES (%s, %s)",
+                (url, code)
+            )
             break
-
-    cursor.execute(
-        "INSERT INTO urls (original_url, short_code, clicks) VALUES (%s, %s, %s)",
-        (url, code, 0)
-    )
+        except psycopg2.errors.UniqueViolation:
+            continue
+    else:
+        raise HTTPException(status_code=500, detail="Could not generate a unique code")
 
     logger.info(f"Shortened URL: {url} -> {code}")
 
     return {
-        "short_url": f"http://localhost:8000/{code}"
+        "short_url": f"{str(request.base_url).rstrip('/')}/{code}",
+        "code": code
     }
-
-
-# 🔹 Redirect
-@router.get("/{code}")
-def redirect_url(code: str):
-    cursor.execute(
-        "SELECT original_url FROM urls WHERE short_code = %s",
-        (code,)
-    )
-    result = cursor.fetchone()
-
-    if not result:
-        raise HTTPException(status_code=404, detail="URL not found")
-
-    cursor.execute(
-        "UPDATE urls SET clicks = clicks + 1 WHERE short_code = %s",
-        (code,)
-    )
-
-    logger.info(f"Redirected {code}")
-
-    return RedirectResponse(url=result[0])
 
 
 # 🔹 Stats endpoint
 @router.get("/stats/{code}")
 def stats(code: str):
     cursor.execute(
-        "SELECT original_url, clicks FROM urls WHERE short_code = %s",
+        "SELECT original_url, clicks, created_at FROM urls WHERE short_code = %s",
         (code,)
     )
     result = cursor.fetchone()
@@ -68,5 +56,24 @@ def stats(code: str):
 
     return {
         "url": result[0],
-        "clicks": result[1]
+        "clicks": result[1],
+        "created_at": result[2]
     }
+
+
+# 🔹 Redirect (registered last so it can't shadow /stats)
+@router.get("/{code}")
+def redirect_url(code: str):
+    # One indexed query both counts the click and returns the target
+    cursor.execute(
+        "UPDATE urls SET clicks = clicks + 1 WHERE short_code = %s RETURNING original_url",
+        (code,)
+    )
+    result = cursor.fetchone()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="URL not found")
+
+    logger.info(f"Redirected {code}")
+
+    return RedirectResponse(url=result[0])
